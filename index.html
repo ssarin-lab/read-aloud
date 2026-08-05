@@ -160,6 +160,15 @@ body.editing .cover .btn.danger{display:block;}
       </div>
       <button class="btn small" id="voiceSampleBtn">&#128266; Voice</button>
     </div>
+    <div id="resumeCard" style="display:none; background:var(--surface); border-radius:12px; padding:14px; margin-bottom:14px; cursor:pointer; align-items:center; gap:12px;">
+      <div id="resumeThumb" style="width:44px; height:64px; border-radius:6px; flex-shrink:0; background-size:cover; background-position:center;"></div>
+      <div style="flex:1; min-width:0;">
+        <div style="font-size:11px; letter-spacing:.1em; color:var(--amber); margin-bottom:3px;">CONTINUE LISTENING</div>
+        <div id="resumeTitle" class="serif" style="font-size:15px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></div>
+        <div id="resumeMeta" style="font-size:12px; color:var(--muted); margin-top:2px;"></div>
+      </div>
+      <div class="btn primary" style="border-radius:50%; width:46px; height:46px; padding:0; display:flex; align-items:center; justify-content:center; font-size:17px;">&#9654;</div>
+    </div>
     <div class="actionRow">
       <button class="btn primary grow" id="addBtn">+ Add book</button>
       <button class="btn" id="pasteToggle">Paste</button>
@@ -219,7 +228,29 @@ body.editing .cover .btn.danger{display:block;}
   <div id="sheet">
     <div class="sheetHandle"></div>
     <div class="sheetTitle serif">Playback settings</div>
-    <label class="ctl">Voice
+    <label class="ctl">Engine
+      <select id="engineSelect">
+        <option value="system">Standard (device voices)</option>
+        <option value="kokoro">Neural &mdash; Kokoro (beta, one-time model download)</option>
+      </select>
+    </label>
+    <div class="ctl" id="kokoroCtl" style="display:none">Neural voice
+      <div class="rowGap">
+        <select id="kokoroVoiceSelect">
+          <option value="af_heart">Heart &mdash; female, US</option>
+          <option value="af_bella">Bella &mdash; female, US</option>
+          <option value="af_nicole">Nicole &mdash; female, US (soft)</option>
+          <option value="am_michael">Michael &mdash; male, US</option>
+          <option value="am_fenrir">Fenrir &mdash; male, US (deep)</option>
+          <option value="bf_emma">Emma &mdash; female, UK</option>
+          <option value="bm_george">George &mdash; male, UK</option>
+          <option value="bm_lewis">Lewis &mdash; male, UK</option>
+        </select>
+        <button class="btn small" id="kokoroTestBtn">Test</button>
+      </div>
+      <div id="kokoroStatus" style="font-size:12px; color:var(--muted); margin-top:6px;"></div>
+    </div>
+    <label class="ctl" id="systemVoiceCtl">Device voice
       <div class="rowGap">
         <select id="voiceSelect"></select>
         <button class="btn small" id="voiceTestBtn">Test</button>
@@ -460,6 +491,8 @@ let current=null;       // {id,title,author,cover,text,position}
 let sentences=[]; let idx=0; let avgWps=12; let skipN=5;
 let playing=false; let rate=1; let voiceURI=""; let voices=[];
 let sleepMin=0; let sleepUntil=null; let mode="cover"; let wakeLock=null;
+let engine="system"; let kokoro=null; let kokoroLoading=false; let kokoroVoice="af_heart";
+let currentAudio=null; let genToken=0; const genCache=new Map();
 
 const $=(id)=>document.getElementById(id);
 
@@ -494,6 +527,87 @@ document.addEventListener("visibilitychange",()=>{
   if(document.visibilityState==="visible" && playing) acquireWakeLock();
 });
 
+/* ============ kokoro neural engine ============ */
+function kokoroStatus(msg){ const el=$("kokoroStatus"); if(el) el.textContent=msg||""; }
+async function ensureKokoro(){
+  if(kokoro) return kokoro;
+  if(kokoroLoading) return null;
+  kokoroLoading=true;
+  try{
+    kokoroStatus("Loading neural engine\u2026");
+    const mod = await import("https://cdn.jsdelivr.net/npm/kokoro-js@1.2.1/+esm");
+    const device = navigator.gpu ? "webgpu" : "wasm";
+    const dtype = device==="webgpu" ? "fp32" : "q8";
+    kokoroStatus("Downloading voice model (one-time)\u2026");
+    kokoro = await mod.KokoroTTS.from_pretrained("onnx-community/Kokoro-82M-v1.0-ONNX",{
+      dtype, device,
+      progress_callback:(p)=>{
+        if(p && p.status==="progress" && p.progress)
+          kokoroStatus("Downloading voice model\u2026 "+Math.round(p.progress)+"%");
+      }
+    });
+    kokoroStatus("Neural voice ready ("+device+"). Press play.");
+    return kokoro;
+  }catch(err){
+    kokoroStatus("Neural voice failed on this device \u2014 using standard voices.");
+    engine="system"; syncEngineUI(); persistSettings();
+    return null;
+  }finally{ kokoroLoading=false; }
+}
+function audioToBlob(a){
+  if(a.toBlob) return a.toBlob();
+  if(a.toWav) return new Blob([a.toWav()],{type:"audio/wav"});
+  throw new Error("Unsupported audio object");
+}
+async function kokoroSentenceBlob(i){
+  if(genCache.has(i)) return genCache.get(i);
+  const audio = await kokoro.generate(sentences[i], { voice: kokoroVoice });
+  const blob = audioToBlob(audio);
+  genCache.set(i, blob);
+  for(const k of genCache.keys()){ if(k < i-2) genCache.delete(k); }
+  return blob;
+}
+function stopAll(){
+  genToken++;
+  speechSynthesis.cancel();
+  if(currentAudio){ try{ currentAudio.pause(); }catch{} currentAudio=null; }
+}
+function speakFromKokoro(start){
+  stopAll();
+  const myToken = genToken;
+  const step = async (i)=>{
+    if(!playing || i>=sentences.length || myToken!==genToken){ if(myToken===genToken) setPlaying(false); return; }
+    if(sleepUntil && Date.now()>sleepUntil){
+      setPlaying(false); sleepUntil=null; sleepMin=0; updateSleepUI(); report(i); return;
+    }
+    idx=i; updatePlayerUI();
+    if(i%5===0) report(i);
+    try{
+      const blob = await kokoroSentenceBlob(i);
+      if(!playing || myToken!==genToken) return;
+      const url = URL.createObjectURL(blob);
+      currentAudio = new Audio(url);
+      currentAudio.playbackRate = rate;
+      currentAudio.onended = ()=>{ URL.revokeObjectURL(url); step(i+1); };
+      currentAudio.onerror = ()=>{ URL.revokeObjectURL(url); setPlaying(false); };
+      await currentAudio.play();
+      kokoroSentenceBlob(i+1).catch(()=>{});
+    }catch(err){
+      if(myToken!==genToken) return;
+      kokoroStatus("Neural playback failed \u2014 switched to standard voice.");
+      engine="system"; syncEngineUI(); persistSettings();
+      speakFromSystem(i);
+    }
+  };
+  setPlaying(true); step(start);
+}
+function syncEngineUI(){
+  const es=$("engineSelect"); if(es) es.value=engine;
+  const kc=$("kokoroCtl"); if(kc) kc.style.display = engine==="kokoro" ? "flex":"none";
+  const sc=$("systemVoiceCtl"); if(sc) sc.style.display = engine==="kokoro" ? "none":"flex";
+  const kv=$("kokoroVoiceSelect"); if(kv) kv.value=kokoroVoice;
+}
+
 /* ============ playback ============ */
 function report(i){
   if(!current) return;
@@ -505,7 +619,14 @@ function report(i){
   renderGrid();
 }
 function speakFrom(start){
-  speechSynthesis.cancel();
+  if(engine==="kokoro"){
+    if(kokoro){ speakFromKokoro(start); return; }
+    ensureKokoro();
+  }
+  speakFromSystem(start);
+}
+function speakFromSystem(start){
+  stopAll();
   const step=(i)=>{
     if(!playing || i>=sentences.length){ setPlaying(false); return; }
     if(sleepUntil && Date.now()>sleepUntil){
@@ -530,7 +651,7 @@ function setPlaying(p){
   if(p) acquireWakeLock(); else releaseWakeLock();
 }
 function togglePlay(){
-  if(playing){ setPlaying(false); speechSynthesis.cancel(); report(idx); }
+  if(playing){ setPlaying(false); stopAll(); report(idx); }
   else speakFrom(idx);
 }
 function seek(n,resume){
@@ -538,7 +659,7 @@ function seek(n,resume){
   report(idx); updatePlayerUI();
   if(resume===undefined) resume=playing;
   if(resume) speakFrom(idx);
-  else { speechSynthesis.cancel(); setPlaying(false); }
+  else { stopAll(); setPlaying(false); }
 }
 
 /* ============ UI: library ============ */
@@ -563,8 +684,10 @@ function renderGrid(){
     div.querySelector(".btn.danger").addEventListener("click",async(e)=>{
       e.stopPropagation();
       await dbDelBook(b.id);
+      const lb = await dbGetKV("lastBook");
+      if(lb===b.id){ dbSetKV("lastBook",null); $("resumeCard").style.display="none"; }
       books=books.filter(x=>x.id!==b.id);
-      if(current && current.id===b.id){ speechSynthesis.cancel(); setPlaying(false); current=null; showTab("library"); $("tabPlayer").disabled=true; }
+      if(current && current.id===b.id){ stopAll(); setPlaying(false); current=null; showTab("library"); $("tabPlayer").disabled=true; }
       renderGrid();
     });
     grid.appendChild(div);
@@ -605,11 +728,12 @@ async function openBook(id){
   const b=await dbGetBook(id);
   if(!b){ banner("error","Could not open that book."); return; }
   current=b;
+  dbSetKV("lastBook", id);
   sentences=splitSentences(b.text);
   avgWps=Math.max(5,Math.round(b.words/sentences.length));
   skipN=Math.max(2,Math.round(80/avgWps));
   idx=Math.min(b.position||0, sentences.length-1);
-  speechSynthesis.cancel(); setPlaying(false);
+  stopAll(); setPlaying(false); genCache.clear();
   $("tabPlayer").disabled=false;
   $("scrub").max=sentences.length-1;
   $("pHeadTitle").textContent=b.title;
@@ -695,7 +819,7 @@ async function restoreBackup(file){
 }
 
 /* ============ events ============ */
-function persistSettings(){ dbSetKV("settings",{rate,voiceURI}); }
+function persistSettings(){ dbSetKV("settings",{rate,voiceURI,engine,kokoroVoice}); }
 $("addBtn").addEventListener("click",()=>$("fileInput").click());
 $("importBtn").addEventListener("click",()=>$("fileInput").click());
 $("fileInput").addEventListener("change",e=>{ handleFiles([...e.target.files]); e.target.value=""; });
@@ -724,7 +848,7 @@ $("voiceSampleBtn").addEventListener("click",()=>{
   sampling=true; $("voiceSampleBtn").textContent="\u25FC Stop";
   speechSynthesis.speak(u);
 });
-$("tabLib").addEventListener("click",()=>showTab("library"));
+$("tabLib").addEventListener("click",()=>{ showTab("library"); renderResumeCard(); });
 $("tabPlayer").addEventListener("click",()=>{ if(current) showTab("player"); });
 $("playBtn").addEventListener("click",togglePlay);
 $("backBtn").addEventListener("click",()=>seek(idx-skipN));
@@ -734,8 +858,9 @@ $("speedBtn").addEventListener("click",()=>{
   const i=SPEEDS.indexOf(rate);
   rate=SPEEDS[(i+1)%SPEEDS.length]||1;
   $("speedRange").value=rate; $("speedLabel").textContent=rate+"\u00D7";
+  if(currentAudio) currentAudio.playbackRate=rate;
   persistSettings(); updatePlayerUI();
-  if(playing) speakFrom(idx);
+  if(playing && engine!=="kokoro") speakFrom(idx);
 });
 $("modeToggle").addEventListener("click",()=>{ mode = mode==="cover"?"text":"cover"; applyMode(); });
 $("settingsBtn").addEventListener("click",()=>{ $("sheetBackdrop").style.display="flex"; });
@@ -743,6 +868,28 @@ $("sleepBtn").addEventListener("click",()=>{ $("sheetBackdrop").style.display="f
 $("sheetBackdrop").addEventListener("click",e=>{ if(e.target.id==="sheetBackdrop") $("sheetBackdrop").style.display="none"; });
 $("sheetDone").addEventListener("click",()=>{ $("sheetBackdrop").style.display="none"; });
 $("voiceSelect").addEventListener("change",e=>{ voiceURI=e.target.value; persistSettings(); });
+$("engineSelect").addEventListener("change",e=>{
+  engine=e.target.value; syncEngineUI(); persistSettings();
+  if(engine==="kokoro") ensureKokoro();
+  if(playing) speakFrom(idx);
+});
+$("kokoroVoiceSelect").addEventListener("change",e=>{
+  kokoroVoice=e.target.value; genCache.clear(); persistSettings();
+  if(playing && engine==="kokoro") speakFrom(idx);
+});
+$("kokoroTestBtn").addEventListener("click",async()=>{
+  const wasPlaying=playing;
+  setPlaying(false); stopAll();
+  const k = await ensureKokoro(); if(!k) return;
+  try{
+    const audio = await k.generate(SAMPLE_TEXT,{voice:kokoroVoice});
+    const url = URL.createObjectURL(audioToBlob(audio));
+    currentAudio = new Audio(url);
+    currentAudio.playbackRate = rate;
+    currentAudio.onended = ()=>{ URL.revokeObjectURL(url); if(wasPlaying) speakFrom(idx); };
+    currentAudio.play();
+  }catch{ kokoroStatus("Test failed on this device."); }
+});
 $("voiceTestBtn").addEventListener("click",()=>{
   const wasPlaying=playing;
   setPlaying(false); speechSynthesis.cancel();
@@ -755,6 +902,7 @@ $("voiceTestBtn").addEventListener("click",()=>{
 $("speedRange").addEventListener("input",e=>{
   rate=parseFloat(e.target.value);
   $("speedLabel").textContent=rate.toFixed(2)+"\u00D7";
+  if(currentAudio) currentAudio.playbackRate=rate;
   persistSettings(); updatePlayerUI();
 });
 $("speedRange").addEventListener("change",()=>{ if(playing) speakFrom(idx); });
@@ -765,13 +913,38 @@ document.querySelectorAll("#sleepRow .btn").forEach(b=>{
     updateSleepUI();
   });
 });
-window.addEventListener("pagehide",()=>{ speechSynthesis.cancel(); });
+window.addEventListener("pagehide",()=>{ stopAll(); });
+
+/* ============ resume ============ */
+async function renderResumeCard(){
+  const lastId = await dbGetKV("lastBook");
+  const card = $("resumeCard");
+  if(!lastId){ card.style.display="none"; return; }
+  const meta = books.find(b=>b.id===lastId);
+  if(!meta){ card.style.display="none"; return; }
+  const b = await dbGetBook(lastId);
+  if(!b){ card.style.display="none"; return; }
+  $("resumeTitle").textContent = meta.title;
+  const sents = splitSentences(b.text);
+  const wps = Math.max(5, Math.round(meta.words/sents.length));
+  const remaining = (sents.length - (b.position||0)) * wps;
+  $("resumeMeta").textContent = (meta.pct||0) + "% \u00B7 " + minutesLeft(remaining, rate) + " left";
+  const th = $("resumeThumb");
+  if(meta.cover){ th.style.backgroundImage = "url(" + meta.cover + ")"; }
+  else { th.style.backgroundImage = "none"; th.style.background = genGradient(meta.title); }
+  card.style.display = "flex";
+  card.onclick = async ()=>{ await openBook(lastId); speakFrom(idx); };
+}
 
 /* ============ init ============ */
 (async function init(){
   db = await openDB();
   const s = await dbGetKV("settings");
-  if(s){ if(s.rate) rate=s.rate; if(s.voiceURI) voiceURI=s.voiceURI; }
+  if(s){ if(s.rate) rate=s.rate; if(s.voiceURI) voiceURI=s.voiceURI;
+         if(s.engine==="kokoro"){ engine="kokoro"; }
+         if(s.kokoroVoice) kokoroVoice=s.kokoroVoice; }
+  syncEngineUI();
+  if(engine==="kokoro") ensureKokoro();
   $("speedRange").value=rate; $("speedLabel").textContent=rate+"\u00D7";
   loadVoices();
   const all = await dbAllBooks();
@@ -779,6 +952,7 @@ window.addEventListener("pagehide",()=>{ speechSynthesis.cancel(); });
     .map(b=>({id:b.id,title:b.title,author:b.author,cover:b.cover,pct:b.pct||0,words:b.words}));
   renderGrid();
   $("emptyMsg").style.display = books.length? "none":"block";
+  renderResumeCard();
 })();
 </script>
 </body>
